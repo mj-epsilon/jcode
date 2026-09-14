@@ -363,6 +363,7 @@ Then trim `src/tools.js` to match:
 // src/tools.js
 import { ReadFileTool }        from './tools/ReadFileTool/ReadFileTool.js'
 import { WriteFileTool }       from './tools/WriteFileTool/WriteFileTool.js'
+import { EditFileTool }        from './tools/EditFileTool/EditFileTool.js'
 import { GrepTool }            from './tools/GrepTool/GrepTool.js'
 import { BashTool }            from './tools/BashTool/BashTool.js'
 import { AskUserQuestionTool } from './tools/AskUserQuestionTool/AskUserQuestionTool.js'
@@ -371,7 +372,7 @@ import { AskUserQuestionTool } from './tools/AskUserQuestionTool/AskUserQuestion
  * All tools registered and available to the query loop.
  *
  * Tool groups:
- *   File    - read, write, search
+ *   File    - read, write, edit, search
  *   Shell   - run commands
  *   HITL    - clarifying questions to the user
  *   Swarm   - spawn/message teammates (added in Part 1)
@@ -379,6 +380,7 @@ import { AskUserQuestionTool } from './tools/AskUserQuestionTool/AskUserQuestion
 export const allTools = [
   ReadFileTool,
   WriteFileTool,
+  EditFileTool,
   GrepTool,
   BashTool,
   AskUserQuestionTool,
@@ -979,7 +981,15 @@ tree can, and eventually will.
 
 /**
  * Mirrors jcode's lifecycle states (docs/SWARM_ARCHITECTURE.md,
- * "Agent Lifecycle States").
+ * "Agent Lifecycle States"), kept to the 8 that matter for a simple swarm.
+ *
+ * Real jcode's `SwarmLifecycleStatus` (crates/jcode-swarm-core/src/lib.rs:136)
+ * has more states than this - RunningStale (no heartbeat), Done (a second
+ * terminal state distinct from Completed), Queued, Pending, and Todo, plus a
+ * catch-all Other(String). Those exist to support the task-DAG scheduler and
+ * connection-heartbeat bookkeeping (Part 4), which this typedef deliberately
+ * does not model. If you extend Part 4's scheduler to drive member status
+ * directly, you will want at least Queued back.
  *
  * @typedef {'spawned'|'ready'|'running'|'blocked'|'completed'|'failed'|'stopped'|'crashed'} MemberStatus
  */
@@ -990,7 +1000,17 @@ tree can, and eventually will.
  * Spawn modes, enforced in Step 9.
  *   adhoc / light - only the root may spawn (one level of fan-out)
  *   deep          - any member may spawn, recursively
- * jcode: SwarmSpawnMode, crates/jcode-config-types/src/lib.rs:643-657
+ *
+ * This is this document's own vocabulary for the depth-gating POLICY
+ * described in prose in docs/SWARM_ARCHITECTURE.md ("Mode-gated spawning":
+ * "Normal ad hoc swarms and light-swarm mode are one-level fan-out... 
+ * Recursive spawning is reserved for roots running in swarm-deep mode").
+ * There is no `adhoc|light|deep` enum anywhere in real jcode. Do not confuse
+ * this with `SwarmSpawnMode` (crates/jcode-config-types/src/lib.rs) - that
+ * real enum is `Visible|Headless|Inline|Auto` and controls whether a spawned
+ * member gets a terminal window, which is an unrelated concern. The closest
+ * real artifact to "deep" is the `swarm-deep` reasoning-effort sentinel string
+ * threaded through the model-provider layer (crates/jcode-base/src/prompt.rs:107).
  *
  * @typedef {'adhoc'|'light'|'deep'} SpawnMode
  */
@@ -2446,7 +2466,15 @@ export async function saveSnapshot(swarm, filePath) {
 
 /**
  * Statuses that described a live process cannot survive a restart.
- * This mirrors jcode's recover_member_status.
+ * This mirrors jcode's recover_member_status, simplified.
+ *
+ * The real function (swarm_persistence.rs:341-390) is also HEADLESS-AWARE:
+ * it only force-crashes a non-terminal member if that member was headless
+ * (no client can ever reattach to it), and a connected TUI client instead
+ * re-marks itself 'ready' on reconnect. This doc's swarm has no
+ * headless/visible distinction, so it simplifies to "any non-terminal status
+ * did not survive" - reasonable here, but know the real rule is more careful
+ * about not crashing a member whose human is still attached.
  */
 export function recoverStatus(status) {
   switch (status) {
@@ -2517,7 +2545,11 @@ closed set of **validated mutations** that are the only legal way to change it.
 # STEP 23 - `src/dag/types.js`
 
 **What jcode does:** `crates/jcode-plan/src/dag/mod.rs` - `Mode` at `:37-49`,
-`NodeOrigin` at `:58-67`, `NodeKind` and `gate_kind()` at `:72-102`.
+`NodeOrigin` at `:58-67`, `NodeKind` and a per-kind `gate_kind()` at `:72-102`.
+The GROUP-level decision this doc's `gateKindForGroup` mirrors (verify only if
+every sibling is implement/fix) lives separately, in
+`crates/jcode-plan/src/dag/ops.rs:102-122`, and is what actually runs when a
+root gate or an expand's gate is created (Step 26).
 
 **Two ideas here carry the whole part.**
 
@@ -2528,10 +2560,12 @@ still all `seed` nodes, nothing decomposed and no gate found anything - the
 plan never outgrew its first guess, which is visible *structurally* rather than
 by reading the output.
 
-**`gateKind()` encodes what "checked" means for different work.** Code-shaped
-work gets a `verify` gate: does it actually run? Research-shaped work gets a
-`critique` gate: what did you miss? Those are different questions and conflating
-them gives you reviewers that test prose and proofread code.
+**`gateKindForGroup()` encodes what "checked" means for different work.**
+Code-shaped work gets a `verify` gate: does it actually run? Research-shaped
+work gets a `critique` gate: what did you miss? Those are different questions
+and conflating them gives you reviewers that test prose and proofread code.
+The decision is made once per GROUP of sibling nodes (not per node) - see the
+note in Step 26 for why.
 
 ```javascript
 // src/dag/types.js
@@ -2572,11 +2606,19 @@ export function isGateKind(kind) {
 }
 
 /**
- * Which gate guards a composite node of this kind.
- * Code-shaped work is verified; everything else is critiqued.
+ * Which gate guards a GROUP of sibling nodes (the children of one expand, or
+ * the top-level seed set). Code-shaped work is verified; everything else is
+ * critiqued - but the decision is made over the WHOLE group, not per node:
+ * real jcode only picks 'verify' when EVERY node in the group is implement/fix,
+ * otherwise it picks 'critique' (jcode: dag/ops.rs:102-122). A single research
+ * node mixed in with nine implementation nodes still gets a critique gate,
+ * because "does it run" is not the right question for that one node.
+ *
+ * @param {{ kind: NodeKind }[]} nodes
  */
-export function gateKind(kind) {
-  return kind === 'implement' || kind === 'fix' ? 'verify' : 'critique'
+export function gateKindForGroup(nodes) {
+  const allCode = nodes.every(n => n.kind === 'implement' || n.kind === 'fix')
+  return allCode ? 'verify' : 'critique'
 }
 
 /**
@@ -2591,14 +2633,25 @@ export function gateKind(kind) {
  *
  * `whatIDidNotCheck` is the important field. Most systems have nowhere to put
  * "I ran out of time before looking at the websocket path", so that knowledge
- * evaporates. Here Step 28 turns each entry into a real node.
+ * evaporates. Here Step 28 turns each entry into a real node. Step 27 makes it
+ * REQUIRED for ordinary (non-gate) nodes in deep mode - jcode does not let a
+ * worker claim it checked everything by simply saying nothing about gaps.
+ *
+ * `evidence` and `edgeCasesConsidered` mirror real jcode's artifact fields
+ * (dag/mod.rs:310-370) and are rendered to whatever depends on this node
+ * (Step 29's `assembleInput`), the same as `findings`. This doc's earlier
+ * drafts omitted them; they are not optional decoration - a downstream node
+ * that only sees `findings` is missing exactly the detail that would let it
+ * trust the upstream work without re-deriving it.
  *
  * @typedef {Object} Artifact
  * @property {string} findings
  * @property {string} confidence          Free text on the wire; parsed in Step 24
+ * @property {string[]} [evidence]         Concrete support for the findings - file paths, command output, quotes
+ * @property {string[]} [edgeCasesConsidered]
  * @property {string[]} [whatIDidNotCheck]
  * @property {string[]} [openQuestions]
- * @property {string} [validation]        Required for implement/fix in deep mode
+ * @property {string} [validation]        Free-form; jcode does NOT require this even for implement/fix
  */
 
 /**
@@ -2607,22 +2660,37 @@ export function gateKind(kind) {
  * @property {NodeKind} kind
  * @property {NodeOrigin} origin
  * @property {NodeStatus} status
- * @property {string} title
- * @property {string} scope
+ * @property {string} content   Pre-formatted task prompt - see the note below
  * @property {string[]} dependsOn
  * @property {string|null} parent
  * @property {boolean} isGate
+ * @property {boolean} expanded   Has expandNode already been called on this node?
+ * @property {string|null} planner   Which actor decomposed this node, if any - used to
+ *                                    re-wake the right agent for synthesis (Step 26/29)
+ * @property {number} priority   Higher runs first when multiple nodes are ready (Step 29)
  * @property {string|null} owner
  * @property {Artifact|null} output
  */
+```
 
+**Why `content` is one field, not two.** Earlier drafts of this doc split a
+node's instructions into `title` + `scope`. Real jcode does not: `TaskNode`
+and `NodeSpec` both carry a single `content: String` that is the fully
+formatted task prompt (`dag/mod.rs:350-390`, `:432-450`), and Step 29's
+`assembleInput` writes it into the worker's prompt verbatim rather than
+reconstructing it from parts. That matters because a title/scope split
+tempts you to recombine them differently in different places; a single
+pre-formatted string has exactly one rendering, decided once, at the moment
+the node is created (by `seed`, `expandNode`, or `injectFromGate`).
+
+```javascript
 /**
  * @typedef {Object} NodeSpec
- * @property {string} id
+ * @property {string} [id]   Omit to let the graph generate one
  * @property {NodeKind} kind
- * @property {string} title
- * @property {string} scope
+ * @property {string} content   The full task prompt, already formatted
  * @property {string[]} [dependsOn]
+ * @property {number} [priority]   Defaults to 5; higher runs first (Step 29)
  */
 
 /**
@@ -2860,10 +2928,25 @@ partial writes, no half-applied decomposition to clean up.
 a node into a parent of new children, and - in deep mode - the parent now waits
 on a gate that waits on those children.
 
+**Three rules a naive port misses, all enforced by the real code:**
+
+1. **A node can only be expanded once.** Real `expand_node` rejects a second
+   call on a node that already has children (`ops.rs:296-300`). Without this,
+   calling it twice quietly overwrites the first batch of children's gate.
+2. **You must currently hold the node to expand it.** Real code requires the
+   node's status to be `Running` - i.e. a worker was actually dispatched to
+   it - not merely "not finished yet". A `queued`-and-unowned node has no
+   owner, so checking only `owner !== actor` lets that check pass trivially;
+   anyone could expand anyone else's undispatched work.
+3. **The gate that guards a decomposition is chosen for the WHOLE group of
+   children, not the parent's own kind.** Real code picks `verify` only when
+   every child is `implement`/`fix`, else `critique` (`ops.rs:102-122`) - see
+   `gateKindForGroup` in Step 23.
+
 ```javascript
 // src/dag/ops.js
 import { TaskGraph, wouldCycle } from './TaskGraph.js'
-import { gateKind, isGateKind, requiresGates, ok, err } from './types.js'
+import { gateKindForGroup, isGateKind, requiresGates, ok, err } from './types.js'
 
 /** Copies a staged graph over the live one. Exported - gates.js uses it too. */
 export function commitStaged(target, staged) {
@@ -2872,17 +2955,21 @@ export function commitStaged(target, staged) {
   }
 }
 
+let nodeIdCounter = 0
+
 function specToNode(spec, parent, origin) {
   return {
-    id: spec.id,
+    id: spec.id ?? `node-${++nodeIdCounter}`,
     kind: spec.kind,
     origin,
     status: 'queued',
-    title: spec.title,
-    scope: spec.scope,
+    content: spec.content,
     dependsOn: spec.dependsOn ? [...spec.dependsOn] : [],
     parent,
     isGate: isGateKind(spec.kind),
+    expanded: false,
+    planner: null,
+    priority: spec.priority ?? 5,
     owner: null,
     output: null,
   }
@@ -2899,7 +2986,7 @@ export function seed(graph, specs) {
   const staged = graph.clone()
 
   for (const spec of specs) {
-    if (staged.has(spec.id)) {
+    if (spec.id && staged.has(spec.id)) {
       return err('duplicate_id', `Node id already exists: ${spec.id}`)
     }
     staged.insert(specToNode(spec, null, 'seed'))
@@ -2928,33 +3015,33 @@ export function seed(graph, specs) {
 /**
  * In deep mode the whole plan is guarded by one root gate that depends on
  * every top-level node. Nothing finishes until a reviewer has looked.
+ * The gate's own kind (verify vs critique) is chosen over the WHOLE top-level
+ * group, mirroring `expandNode` below - see `gateKindForGroup` in Step 23.
  * jcode: ops.rs:143-209
  */
 export function ensureRootGate(graph) {
   const gateId = 'root::gate'
+  const topLevel = graph.all().filter(n => n.parent === null && !n.isGate)
+
   if (graph.has(gateId)) {
-    graph.patch(gateId, {
-      dependsOn: graph.all()
-        .filter(n => n.parent === null && !n.isGate)
-        .map(n => n.id),
-    })
+    graph.patch(gateId, { dependsOn: topLevel.map(n => n.id) })
     return gateId
   }
 
-  const topLevel = graph.all().filter(n => n.parent === null && !n.isGate)
-
   graph.insert({
     id: gateId,
-    kind: 'critique',
+    kind: gateKindForGroup(topLevel),
     origin: 'gate',
     status: 'queued',
-    title: 'Review the whole plan',
-    scope:
+    content:
       'Audit every top-level node by id. Confirm the plan actually covers the ' +
       'task, and inject work for anything missing.',
     dependsOn: topLevel.map(n => n.id),
     parent: null,
     isGate: true,
+    expanded: false,
+    planner: null,
+    priority: 5,
     owner: null,
     output: null,
   })
@@ -2965,6 +3052,11 @@ export function ensureRootGate(graph) {
 /**
  * Decomposes a node into children. The node becomes a parent that waits on
  * them (via its gate in deep mode).
+ *
+ * Returns `{ childIds, gateId }` - real jcode's `ExpandOutcome` (ops.rs:266-269)
+ * carries both, because callers (Step 42's graph tool) need the gate id to
+ * reference the reviewer that now guards this decomposition.
+ *
  * jcode: ops.rs:227-367
  */
 export function expandNode(graph, nodeId, actor, specs) {
@@ -2973,7 +3065,16 @@ export function expandNode(graph, nodeId, actor, specs) {
   if (node.isGate) {
     return err('wrong_status', `Node ${nodeId} is a gate; gates inject work, they do not expand`)
   }
-  if (node.status === 'done') return err('wrong_status', `Node ${nodeId} is already done`)
+  if (node.expanded) {
+    return err('already_expanded', `Node ${nodeId} was already expanded; you cannot expand it twice`)
+  }
+  if (node.status !== 'running') {
+    return err(
+      'wrong_status',
+      `Node ${nodeId} is ${node.status}, not running. You can only expand a node you are ` +
+      `actively holding - it must have been dispatched to you first.`
+    )
+  }
   if (node.owner !== null && node.owner !== actor) {
     return err('not_owner', `Node ${nodeId} is owned by ${node.owner}, not ${actor}`)
   }
@@ -2985,11 +3086,12 @@ export function expandNode(graph, nodeId, actor, specs) {
   const childIds = []
 
   for (const spec of specs) {
-    if (staged.has(spec.id)) {
+    if (spec.id && staged.has(spec.id)) {
       return err('duplicate_id', `Node id already exists: ${spec.id}`)
     }
-    staged.insert(specToNode(spec, nodeId, 'expand'))
-    childIds.push(spec.id)
+    const child = specToNode(spec, nodeId, 'expand')
+    staged.insert(child)
+    childIds.push(child.id)
   }
 
   for (const id of childIds) {
@@ -3000,21 +3102,25 @@ export function expandNode(graph, nodeId, actor, specs) {
     }
   }
 
+  let gateId = null
   if (requiresGates(staged.mode)) {
     // The parent waits on a gate; the gate waits on the children.
-    const gateId = `${nodeId}::gate`
+    gateId = `${nodeId}::gate`
+    const children = childIds.map(id => staged.get(id))
     staged.insert({
       id: gateId,
-      kind: gateKind(node.kind),
+      kind: gateKindForGroup(children),
       origin: 'gate',
       status: 'queued',
-      title: `Review ${node.title}`,
-      scope:
+      content:
         `Audit every child of ${nodeId} by id. Address each one, or inject work ` +
         `for what is missing.`,
       dependsOn: childIds,
       parent: nodeId,
       isGate: true,
+      expanded: false,
+      planner: null,
+      priority: node.priority,
       owner: null,
       output: null,
     })
@@ -3023,15 +3129,17 @@ export function expandNode(graph, nodeId, actor, specs) {
     staged.patch(nodeId, { dependsOn: [...new Set([...node.dependsOn, ...childIds])] })
   }
 
-  // The parent goes back in the queue: its job is now to synthesize.
-  staged.patch(nodeId, { status: 'queued', owner: null })
+  // The parent goes back in the queue: its job is now to synthesize. Marking
+  // it `expanded` blocks a second expandNode call, and `planner` records who
+  // decomposed it so Step 29 can re-wake the same actor for synthesis.
+  staged.patch(nodeId, { status: 'queued', owner: null, expanded: true, planner: actor })
 
   if (wouldCycle(staged)) {
     return err('cycle', 'That decomposition would create a cycle')
   }
 
   commitStaged(graph, staged)
-  return ok(childIds)
+  return ok({ childIds, gateId })
 }
 ```
 
@@ -3046,6 +3154,24 @@ export function expandNode(graph, nodeId, actor, specs) {
 structured artifact, and in deep mode that artifact is validated before the
 node closes. "Done" has to be earned.
 
+**Three rules the real validator enforces that are easy to get wrong (or
+over-strict) in a port:**
+
+1. **Gates are exempt.** A gate's artifact is a pass/fail audit record, not a
+   piece of work - real code returns `Ok(())` immediately when `is_gate` is
+   true (`ops.rs:750-752`), before any of the checks below run.
+2. **`findings` just needs to be non-empty**, not some invented minimum
+   length. Real code checks `is_empty()` (`ops.rs:754-757`) - nothing more.
+   Rejecting short-but-honest findings ("Confirmed: no auth bypass.") for
+   being under a character count is a rule this doc invented, not one jcode
+   enforces.
+3. **`whatIDidNotCheck` is required, not optional, for ordinary nodes in deep
+   mode** (`ops.rs:759-765`). This is the one substantive gate on completion:
+   a worker cannot claim total coverage by simply not filling in the field.
+   There is no real requirement that `implement`/`fix` nodes supply a
+   `validation` field - that field exists on the artifact but nothing forces
+   it.
+
 ```javascript
 // src/dag/complete.js
 import { parseConfidence } from './confidence.js'
@@ -3055,11 +3181,14 @@ import { requiresGates, ok, err } from './types.js'
 export function validateArtifact(graph, node, artifact) {
   if (!requiresGates(graph.mode)) return ok(undefined)
 
-  if (!artifact?.findings || artifact.findings.trim().length < 20) {
+  // Gates are pass/fail audit records - the thinness rules below don't apply.
+  if (node.isGate) return ok(undefined)
+
+  if (!artifact?.findings || artifact.findings.trim().length === 0) {
     return err(
       'invalid_artifact',
-      `Node ${node.id}: 'findings' must actually describe what you found ` +
-      `(at least a sentence). A bare "done" is not a completion report.`
+      `Node ${node.id}: 'findings' must actually describe what you found. ` +
+      `An empty string is not a completion report.`
     )
   }
 
@@ -3071,11 +3200,12 @@ export function validateArtifact(graph, node, artifact) {
     )
   }
 
-  if ((node.kind === 'implement' || node.kind === 'fix') && !artifact.validation) {
+  if (!artifact.whatIDidNotCheck || artifact.whatIDidNotCheck.length === 0) {
     return err(
       'invalid_artifact',
-      `Node ${node.id} changed code, so 'validation' is required: ` +
-      `what did you run, and what did it say?`
+      `Node ${node.id}: 'whatIDidNotCheck' is required and must be non-empty. ` +
+      `Nothing is ever fully covered - name at least one thing you skipped or ` +
+      `did not have time for, even something minor.`
     )
   }
 
@@ -3302,23 +3432,26 @@ export function injectFromGate(graph, gateId, actor, specs) {
   const newIds = []
 
   for (const spec of specs) {
-    if (staged.has(spec.id)) {
+    if (spec.id && staged.has(spec.id)) {
       return err('duplicate_id', `Node id already exists: ${spec.id}`)
     }
+    const id = spec.id ?? `gap-${gateId}-${newIds.length + 1}`
     staged.insert({
-      id: spec.id,
+      id,
       kind: spec.kind,
       origin: 'gap',                 // <- the growth signal
       status: 'queued',
-      title: spec.title,
-      scope: spec.scope,
+      content: spec.content,
       dependsOn: spec.dependsOn ? [...spec.dependsOn] : [],
       parent: gate.parent,
       isGate: false,
+      expanded: false,
+      planner: null,
+      priority: spec.priority ?? gate.priority,
       owner: null,
       output: null,
     })
-    newIds.push(spec.id)
+    newIds.push(id)
   }
 
   // The gate re-runs once the gap work lands.
@@ -3352,8 +3485,7 @@ export function gapSpecsFrom(node, prefix = 'gap') {
   return (node?.output?.whatIDidNotCheck ?? []).map((gap, i) => ({
     id: `${prefix}-${node.id}-${i + 1}`,
     kind: 'explore',
-    title: gap.slice(0, 60),
-    scope: `Cover what ${node.id} explicitly did not check: ${gap}`,
+    content: `Cover what ${node.id} explicitly did not check: ${gap}`,
   }))
 }
 ```
@@ -3390,13 +3522,20 @@ export function isTerminal(node) {
   return node.status === 'done' || node.status === 'failed'
 }
 
-/** Queued, unowned, all dependencies done. "Blocked" is the absence of this. */
+/**
+ * Queued, unowned, all dependencies done. "Blocked" is the absence of this.
+ * Sorted by priority (higher first) so that when several nodes are ready at
+ * once, the more important ones dispatch first once a worker slot frees up -
+ * jcode: schedule.rs:21.
+ */
 export function readyNodes(graph) {
-  return graph.all().filter(node => {
-    if (node.status !== 'queued') return false
-    if (node.owner !== null) return false
-    return node.dependsOn.every(id => graph.get(id)?.status === 'done')
-  })
+  return graph.all()
+    .filter(node => {
+      if (node.status !== 'queued') return false
+      if (node.owner !== null) return false
+      return node.dependsOn.every(id => graph.get(id)?.status === 'done')
+    })
+    .sort((a, b) => b.priority - a.priority)
 }
 
 /** Claim a node for a worker. Returns false if someone else got there first. */
@@ -3409,12 +3548,17 @@ export function dispatch(graph, nodeId, worker) {
   return true
 }
 
-/** Build a node's prompt from its own scope plus its dependencies' artifacts. */
+/**
+ * Build a node's prompt from its own pre-formatted content plus its
+ * dependencies' artifacts. `node.content` is used as-is - it is not
+ * reconstructed from separate fields, matching real jcode's `assemble_input`
+ * (schedule.rs:64-101), which does `out.push_str(&node.content)` directly.
+ */
 export function assembleInput(graph, nodeId) {
   const node = graph.get(nodeId)
   if (!node) return ''
 
-  const parts = [`# Task: ${node.title}`, '', node.scope, '']
+  const parts = [node.content, '']
 
   const upstream = node.dependsOn
     .map(id => graph.get(id))
@@ -3423,9 +3567,13 @@ export function assembleInput(graph, nodeId) {
   if (upstream.length > 0) {
     parts.push('## Results from the work you depend on', '')
     for (const dep of upstream) {
-      parts.push(`### ${dep.id} - ${dep.title}`)
+      parts.push(`### ${dep.id}`)
       parts.push(dep.output.findings)
       if (dep.output.confidence) parts.push(`confidence: ${dep.output.confidence}`)
+      const evidence = dep.output.evidence ?? []
+      if (evidence.length > 0) parts.push(`evidence: ${evidence.join('; ')}`)
+      const edgeCases = dep.output.edgeCasesConsidered ?? []
+      if (edgeCases.length > 0) parts.push(`edge cases considered: ${edgeCases.join('; ')}`)
       const gaps = dep.output.whatIDidNotCheck ?? []
       if (gaps.length > 0) parts.push(`did NOT check: ${gaps.join('; ')}`)
       parts.push('')
@@ -3468,19 +3616,29 @@ so nothing can interleave. The Step 7 rule paying off.
 // test/dag.test.js
 import { describe, it, expect } from 'vitest'
 import { TaskGraph } from '../src/dag/TaskGraph.js'
-import { seed } from '../src/dag/ops.js'
+import { seed, expandNode } from '../src/dag/ops.js'
 import { completeNode } from '../src/dag/complete.js'
 import { passGate, mentionsNodeId } from '../src/dag/gates.js'
+import { dispatch } from '../src/dag/scheduler.js'
 
-const artifact = (findings, confidence = 'high') => ({ findings, confidence })
+// A default whatIDidNotCheck is required for non-gate completions in deep
+// mode (Step 27) - the tests below always supply one unless testing that
+// requirement itself.
+const artifact = (findings, confidence = 'high', whatIDidNotCheck = ['nothing major']) => (
+  { findings, confidence, whatIDidNotCheck }
+)
 
 describe('gates', () => {
   it('rejects a rubber stamp', () => {
     const graph = new TaskGraph('deep')
     seed(graph, [
-      { id: 'a', kind: 'explore', title: 'A', scope: 'look at A' },
-      { id: 'b', kind: 'explore', title: 'B', scope: 'look at B' },
+      { id: 'a', kind: 'explore', content: 'look at A' },
+      { id: 'b', kind: 'explore', content: 'look at B' },
     ])
+    // Nodes must be dispatched (status 'running') before they can complete or
+    // expand - see Step 26's expandNode fix. dispatch() puts them there.
+    dispatch(graph, 'a', 'w1')
+    dispatch(graph, 'b', 'w2')
     completeNode(graph, 'a', 'w1', artifact('Found the A subsystem, it uses REST.'))
     completeNode(graph, 'b', 'w2', artifact('Found the B subsystem, it uses gRPC.'))
 
@@ -3859,6 +4017,7 @@ export const multimonitorScript = (turn, params) => {
       text: artifact({
         findings: 'Window placement stores absolute coordinates, which break when the monitor layout changes.',
         confidence: 'high',
+        whatIDidNotCheck: ['multi-DPI scaling interactions'],
       }),
     }
   }
@@ -3867,6 +4026,7 @@ export const multimonitorScript = (turn, params) => {
     text: artifact({
       findings: `Completed: ${prompt.slice(0, 100).replace(/\n/g, ' ')}`,
       confidence: 'high',
+      whatIDidNotCheck: ['nothing major for this stub task'],
     }),
   }
 }
@@ -3911,19 +4071,20 @@ const swarm = new Swarm({
   systemPromptFor: () =>
     'You are a worker in a swarm. Do the task described, then reply with ONLY an ' +
     '<artifact>...</artifact> block containing JSON with: findings, confidence, ' +
-    'and optionally whatIDidNotCheck (an array of things you did not examine).',
+    'and whatIDidNotCheck (a non-empty array of things you did not examine - ' +
+    'required, since nothing is ever fully covered).',
   createStreamFactory: createMockClientFactory(multimonitorScript, { latencyMs: 120 }),
 })
 
 const graph = new TaskGraph(dagMode)
 
 seed(graph, [
-  { id: 'display-detection', kind: 'explore', title: 'Display detection',
-    scope: 'How does display detection work today?' },
-  { id: 'window-placement', kind: 'explore', title: 'Window placement',
-    scope: 'How does window placement work today?' },
-  { id: 'synthesis', kind: 'synthesize', title: 'Plan multimonitor support',
-    scope: 'Combine the findings into a plan.',
+  { id: 'display-detection', kind: 'explore',
+    content: 'How does display detection work today?' },
+  { id: 'window-placement', kind: 'explore',
+    content: 'How does window placement work today?' },
+  { id: 'synthesis', kind: 'synthesize',
+    content: 'Combine the findings into a plan.',
     dependsOn: ['display-detection', 'window-placement'] },
 ])
 
@@ -4024,9 +4185,20 @@ commands and writes files, and then made six copies of it. Every
 **Why a swarm cannot use an interactive prompt.** For one agent, "ask the user
 Y/N" works fine - that is what your `AskUserQuestionTool` does. For six agents
 running concurrently, you get six modal prompts racing for one terminal, and a
-human who becomes the bottleneck the parallelism was supposed to remove. jcode
-solves this with rules evaluated per call plus modes that pre-authorize whole
-classes of action (`docs/SAFETY_SYSTEM.md`). Rules scale; prompts do not.
+human who becomes the bottleneck the parallelism was supposed to remove.
+
+**This is deliberately NOT what `docs/SAFETY_SYSTEM.md` does.** That document
+describes jcode's real safety layer for *unmonitored single-agent* use (ambient
+mode): a two-tier auto-allowed/requires-permission classifier backed by a
+persistent **review queue** and notification channels (email, SMS, desktop,
+webhook) so a human can approve or deny asynchronously. That shape assumes one
+agent and one pending decision at a time - it does not scale to six agents
+each blocking on a human reviewer simultaneously, which is exactly the
+bottleneck above. So this step builds something different on purpose: a
+synchronous, no-human-in-the-loop rule engine, evaluated per call, with rules
+strict enough that "requires permission" isn't a real tier - actions are
+either allowed or refused outright. Rules scale to a swarm; a review queue
+does not.
 
 **What to write:**
 
@@ -4175,9 +4347,9 @@ Rules:
 
 Reply with ONLY a JSON array, no prose:
 [
-  {"id":"...","kind":"explore","title":"...","scope":"a full paragraph telling
-   the agent exactly what to find out","dependsOn":[]},
-  {"id":"synthesis","kind":"synthesize","title":"...","scope":"...",
+  {"id":"...","kind":"explore","content":"a full paragraph telling the agent
+   exactly what to find out","dependsOn":[]},
+  {"id":"synthesis","kind":"synthesize","content":"...",
    "dependsOn":["...","..."]}
 ]`
 
@@ -4226,7 +4398,7 @@ export async function planTask({ task, createStream, folderPath }) {
   // anyway, but the error is far clearer here.
   const ids = new Set()
   for (const spec of specs) {
-    if (!spec?.id || !spec?.kind || !spec?.title || !spec?.scope) {
+    if (!spec?.id || !spec?.kind || !spec?.content) {
       return { ok: false, reason: `Node missing required fields: ${JSON.stringify(spec)}`, raw }
     }
     if (ids.has(spec.id)) {
@@ -4579,12 +4751,12 @@ const createStreamFactory = useMock
 let specs
 if (useMock) {
   specs = [
-    { id: 'display-detection', kind: 'explore', title: 'Display detection',
-      scope: 'How does display detection work today?' },
-    { id: 'window-placement', kind: 'explore', title: 'Window placement',
-      scope: 'How does window placement work today?' },
-    { id: 'synthesis', kind: 'synthesize', title: 'Plan multimonitor support',
-      scope: 'Combine the findings into a plan.',
+    { id: 'display-detection', kind: 'explore',
+      content: 'How does display detection work today?' },
+    { id: 'window-placement', kind: 'explore',
+      content: 'How does window placement work today?' },
+    { id: 'synthesis', kind: 'synthesize',
+      content: 'Combine the findings into a plan.',
       dependsOn: ['display-detection', 'window-placement'] },
   ]
 } else {
@@ -4623,7 +4795,8 @@ const swarm = new Swarm({
       ? 'You orchestrate a team of agents working on a codebase.'
       : 'You are an investigator on a team. Do the task described using read and grep. ' +
         'Then reply with ONLY an <artifact>...</artifact> block containing JSON with: ' +
-        'findings, confidence, and optionally whatIDidNotCheck.',
+        'findings, confidence, and whatIDidNotCheck (required, non-empty - name at ' +
+        'least one thing you did not examine).',
   createStreamFactory,
 })
 
@@ -4660,7 +4833,7 @@ console.log(`cost: ${cost.report()}`)
 // The actual output: every finished node's findings.
 for (const node of graph.all()) {
   if (node.status === 'done' && !node.isGate) {
-    console.log(`\n=== ${node.id} - ${node.title} ===\n${node.output.findings}`)
+    console.log(`\n=== ${node.id} ===\n${node.output.findings}`)
   }
 }
 ```
@@ -4795,16 +4968,18 @@ import { injectFromGate, passGate } from '../../dag/gates.js'
 import { assembleInput } from '../../dag/scheduler.js'
 
 const nodeSpec = z.object({
-  id: z.string(),
+  id: z.string().optional(),
   kind: z.enum(['explore', 'implement', 'verify', 'fix', 'synthesize', 'critique']),
-  title: z.string(),
-  scope: z.string(),
+  content: z.string(),
   dependsOn: z.array(z.string()).optional(),
+  priority: z.number().optional(),
 })
 
 const artifact = z.object({
   findings: z.string(),
   confidence: z.string(),
+  evidence: z.array(z.string()).optional(),
+  edgeCasesConsidered: z.array(z.string()).optional(),
   whatIDidNotCheck: z.array(z.string()).optional(),
   openQuestions: z.array(z.string()).optional(),
   validation: z.string().optional(),
@@ -4818,7 +4993,10 @@ export const GraphTool = buildTool({
     'only) when you find work that is missing.',
 
   inputSchema: z.object({
-    action: z.enum(['task_graph', 'expand_node', 'complete_node', 'inject_gap']),
+    // 'seed_graph' is accepted as an alias for 'task_graph', matching real
+    // jcode's tool (communicate.rs:2557), which allows either name for the
+    // read action.
+    action: z.enum(['task_graph', 'seed_graph', 'expand_node', 'complete_node', 'inject_gap']),
     node_id: z.string().optional(),
     specs: z.array(nodeSpec).optional(),
     artifact: artifact.optional(),
@@ -4833,9 +5011,10 @@ export const GraphTool = buildTool({
     const actor = sessionId
 
     switch (input.action) {
-      case 'task_graph': {
+      case 'task_graph':
+      case 'seed_graph': {
         const lines = graph.all().map(n =>
-          `${n.id} [${n.status}] ${n.isGate ? '(gate) ' : ''}${n.title}` +
+          `${n.id} [${n.status}] ${n.isGate ? '(gate) ' : ''}${n.content.slice(0, 60)}` +
           (n.dependsOn.length ? ` <- ${n.dependsOn.join(', ')}` : '')
         )
         const { seeded, grown } = graph.growthStats()
@@ -4848,8 +5027,9 @@ export const GraphTool = buildTool({
         }
         const result = expandNode(graph, input.node_id, actor, input.specs)
         return result.ok
-          ? { data: `Expanded ${input.node_id} into: ${result.value.join(', ')}. ` +
-                    `They will be scheduled once their dependencies are done.` }
+          ? { data: `Expanded ${input.node_id} into: ${result.value.childIds.join(', ')}` +
+                    (result.value.gateId ? ` (guarded by ${result.value.gateId})` : '') +
+                    `. They will be scheduled once their dependencies are done.` }
           : { data: `Rejected (${result.error.code}): ${result.error.message}` }
       }
 
