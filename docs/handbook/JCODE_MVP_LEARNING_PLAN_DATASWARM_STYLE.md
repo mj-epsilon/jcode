@@ -408,7 +408,12 @@ which yields exactly two event shapes:
 { type: 'tool_use_block', block, assistantMessage }
 ```
 
-Match it precisely and `query.js` cannot tell the difference.
+Match the shapes and `query.js` cannot tell the difference. One honest nit on
+order: the real client yields the `tool_use_block` events first and the
+`assistant_message` last (client.js emits blocks as they arrive, then the
+finished message); the mock below emits the message first. `query.js` handles
+each event type independently, so both orders work - but know that they differ
+if you ever write a test that asserts on event sequence.
 
 ```javascript
 // src/services/api/mockClient.js
@@ -1233,8 +1238,13 @@ export function canSpawn(registry, requesterId, policy) {
   const member = registry.get(requesterId)
   if (!member) return { ok: false, reason: 'Requester is not a swarm member' }
 
-  if (registry.count() >= MAX_SWARM_MEMBERS) {
-    return { ok: false, reason: `Swarm is at its cap of ${MAX_SWARM_MEMBERS} members` }
+  // Cap counts LIVE (non-terminal) members, so completed workers free their
+  // slot. This deliberately diverges from an absolute total-ever cap, because
+  // this MVP never removes members from the registry - a DAG run that spawns
+  // one worker per node would exhaust a total cap in a few dozen nodes and
+  // then mysteriously refuse to schedule anything.
+  if (liveWorkerCount(registry) >= MAX_SWARM_MEMBERS) {
+    return { ok: false, reason: `Swarm is at its cap of ${MAX_SWARM_MEMBERS} live members` }
   }
 
   const live = liveWorkerCount(registry)
@@ -2668,6 +2678,8 @@ export function gateKindForGroup(nodes) {
  * @property {string|null} planner   Which actor decomposed this node, if any - used to
  *                                    re-wake the right agent for synthesis (Step 26/29)
  * @property {number} priority   Higher runs first when multiple nodes are ready (Step 29)
+ * @property {string} [feedback]   Set by the runner when a gate attempt is rejected;
+ *                                  surfaced by assembleInput so the retry knows why
  * @property {string|null} owner
  * @property {Artifact|null} output
  */
@@ -3591,6 +3603,13 @@ export function assembleInput(graph, nodeId) {
       'inject a gap node instead of passing. Listing something under',
       'whatIDidNotCheck does NOT count as addressing it.'
     )
+
+    // A rejected gate re-runs with a FRESH worker. Without this block the
+    // retry's prompt is byte-identical to the failed attempt, so it fails the
+    // same way forever. The rejection message is the only steering signal.
+    if (node.feedback) {
+      parts.push('', '## Previous attempt rejected', node.feedback)
+    }
   }
 
   return parts.join('\n')
@@ -3777,12 +3796,19 @@ export async function runGraph(graph, swarm, coordinatorId, options) {
         completed++
         options.onResult?.(task.nodeId, true, artifact.findings.slice(0, 80))
 
-        // An honest admission becomes real work.
+        // An honest admission becomes real work. Two guards keep this bounded:
+        // gap-origin nodes do NOT re-inject (whatIDidNotCheck is required on
+        // every completion, so without this guard every gap node would breed
+        // more gap nodes forever), and top-level seed nodes route to the root
+        // gate - they have no parent, so `${node.parent}::gate` would
+        // silently never match anything.
         const node = graph.get(task.nodeId)
-        const gaps = gapSpecsFrom(node)
-        if (gaps.length > 0 && node?.parent) {
-          const gateId = `${node.parent}::gate`
-          if (graph.has(gateId)) injectFromGate(graph, gateId, task.workerId, gaps)
+        if (node && !node.isGate && node.origin !== 'gap') {
+          const gaps = gapSpecsFrom(node)
+          const gateId = node.parent ? `${node.parent}::gate` : 'root::gate'
+          if (gaps.length > 0 && graph.has(gateId)) {
+            injectFromGate(graph, gateId, task.workerId, gaps)
+          }
         }
         continue
       }
@@ -3790,8 +3816,11 @@ export async function runGraph(graph, swarm, coordinatorId, options) {
       options.onResult?.(task.nodeId, false, outcome.error.message)
 
       if (task.isGate) {
-        // A rejected gate re-runs; the next worker sees why in assembleInput.
-        graph.patch(task.nodeId, { status: 'queued', owner: null })
+        // A rejected gate re-runs. Store the rejection ON the node so the next
+        // attempt's assembleInput includes it - the retry is a fresh worker,
+        // and without this it sees a byte-identical prompt and rubber-stamps
+        // the same way forever.
+        graph.patch(task.nodeId, { status: 'queued', owner: null, feedback: outcome.error.message })
       } else {
         failNode(graph, task.nodeId, task.workerId, outcome.error.message)
       }
@@ -3986,8 +4015,11 @@ export const multimonitorScript = (turn, params) => {
     const match = prompt.match(/address EVERY one of these by id: (.+)/)
     const ids = match ? match[1].split(',').map(s => s.trim()) : []
 
-    // FIRST attempt: a rubber stamp. This gets rejected by name.
-    if (turn === 0) {
+    // FIRST attempt: a rubber stamp. This gets rejected by name. Keyed on the
+    // ABSENCE of rejection feedback rather than the turn counter, because each
+    // gate re-run is a FRESH worker whose own mock starts back at turn 0 -
+    // keying on `turn === 0` would rubber-stamp on every retry, forever.
+    if (!prompt.includes('Previous attempt rejected')) {
       return { text: artifact({ findings: 'Reviewed the work. All good, no gaps found.', confidence: 'high' }) }
     }
 
@@ -4129,15 +4161,20 @@ node src/entrypoints/cli.jsx --mock
 1. **Two workers running side by side** on the first pass - `display-detection`
    and `window-placement` have no dependencies, so `readyNodes` returns both and
    they dispatch together. Parallelism (Parts 1-2).
-2. **A `REJECTED root::gate` line naming both node ids.** The gate's first
-   artifact was "All good, no gaps found" and the coverage check refused it.
-   Step 28 working, and the most satisfying line in the run.
-3. **The gate re-running and passing** once it names each node.
-4. **A `G`-marked gap node appearing** from `display-detection`'s admission
-   about unplugging a monitor mid-render. The graph grew because a worker was
-   honest.
-5. **`synthesis` running last**, because it depends on both explorations and,
-   in deep mode, on the gate.
+2. **A `REJECTED root::gate` line naming the unaudited node ids.** The gate's
+   first artifact was "All good, no gaps found" and the coverage check refused
+   it. Step 28 working, and the most satisfying line in the run.
+3. **The gate re-running and passing.** The rejection was stored on the gate
+   node, so the retry's prompt carries it under "Previous attempt rejected" -
+   and the mock (like a real model reading the error) responds by naming every
+   id. Watch for this feedback loop; it is the convergence mechanism.
+4. **`G`-marked gap nodes appearing** from the explorations' admissions (the
+   mid-render unplug, the multi-DPI question), routed to `root::gate` because
+   seed nodes have no parent gate of their own. The graph grew because workers
+   were honest.
+5. **`synthesis` running after both explorations**, and the **root gate running
+   last** - it depends on every top-level node, including `synthesis` and the
+   injected gap nodes, so it cannot pass until everything else has settled.
 6. **`grown` greater than zero** in the summary.
 
 Then run with `--light` and watch the difference: no gates, no rejection, no
@@ -5095,10 +5132,15 @@ Replace the result-handling block in
         completed++
         options.onResult?.(task.nodeId, true, node.output?.findings?.slice(0, 80) ?? '')
 
-        const gaps = gapSpecsFrom(node)
-        if (gaps.length > 0 && node.parent) {
-          const gateId = `${node.parent}::gate`
-          if (graph.has(gateId)) injectFromGate(graph, gateId, task.workerId, gaps)
+        // Fallback gap injection for workers that completed via the tool but
+        // did not inject their own gaps. Same bounds as Step 30: never from
+        // gap-origin nodes, and top-level nodes route to the root gate.
+        if (!node.isGate && node.origin !== 'gap') {
+          const gaps = gapSpecsFrom(node)
+          const gateId = node.parent ? `${node.parent}::gate` : 'root::gate'
+          if (gaps.length > 0 && graph.has(gateId)) {
+            injectFromGate(graph, gateId, task.workerId, gaps)
+          }
         }
         continue
       }
@@ -5125,7 +5167,7 @@ Replace the result-handling block in
 
       options.onResult?.(task.nodeId, false, outcome.error.message)
       if (task.isGate) {
-        graph.patch(task.nodeId, { status: 'queued', owner: null })
+        graph.patch(task.nodeId, { status: 'queued', owner: null, feedback: outcome.error.message })
       } else {
         failNode(graph, task.nodeId, task.workerId, outcome.error.message)
       }
