@@ -207,6 +207,10 @@ first plan spent eight steps building from nothing.
 
 # STEP 1 - Fork and strip
 
+**In plain English:** copy your CLI into a new project, delete the
+data-analysis tools that have nothing to do with agents, and add the three
+file tools (read, search, precise-edit) that a coding swarm actually needs.
+
 ```bash
 cp -r data-swarm-cli jcode-mvp && cd jcode-mvp
 rm -rf src/tools/DatabaseSchemaTool src/tools/QueryExecutorTool src/tools/GA4Tools
@@ -395,6 +399,10 @@ Everything else - `query.js`, `QueryEngine.js`, `Tool.js`,
 
 # STEP 2 - `src/services/api/mockClient.js`
 
+**In plain English:** a fake model. Instead of calling Anthropic, it replays
+answers you scripted - so a whole swarm run costs nothing, finishes instantly,
+and behaves identically every time you debug it.
+
 **Why this is Step 2 and not Step 30:** you are about to run ten agents at
 once. If every run costs money, takes ninety seconds, and makes slightly
 different choices each time, you will not iterate - you will guess. A scripted
@@ -527,6 +535,10 @@ config in Part 1.
 
 # STEP 3 - Fix `BashTool`: `spawnSync` to `spawn`
 
+**In plain English:** your shell tool currently freezes the entire program
+while a command runs. This change makes commands run in the background, so
+one agent running `npm test` no longer stops every other agent dead.
+
 **This step is load-bearing, and it is easy to skip because the tool already
 works.**
 
@@ -629,6 +641,10 @@ only `isReadOnly` decides scheduling.
 
 # STEP 4 - AbortController through `sessionContext`
 
+**In plain English:** a cancel button. One shared signal that says "stop" -
+and because each child's signal is chained to its parent's, cancelling an
+agent automatically cancels everything it spawned.
+
 **What is missing:** `AbortController` appears nowhere in data-swarm-cli. For
 one interactive agent you can live without it. For a swarm you cannot - killing
 a subtree, enforcing a deadline, and shutting down cleanly all need a signal
@@ -709,6 +725,11 @@ mid-flight abort, which is why Step 3 wired `signal` into `BashTool`.
 ---
 
 # STEP 5 - `StreamingToolExecutor`: optional streaming, and honest concurrency
+
+**In plain English:** the tool scheduler - the piece that decides which of an
+agent's tool calls may run at the same time (reads together, writes alone).
+This step makes that parallelism explicit in the code and lets a slow tool
+report progress while it works.
 
 Two changes to a file you already have.
 
@@ -971,6 +992,11 @@ reconstructs its entire spawn tree by following one string field
 
 # STEP 6 - `src/swarm/types.js`
 
+**In plain English:** the vocabulary file. It defines what a swarm member IS:
+a small record with an id, a lifecycle status (running, completed, crashed...),
+a role, and one pointer - `reportBackTo` - naming who it works for. No
+behaviour lives here, just the shapes everything else agrees on.
+
 **What jcode does:** members live in a registry keyed by session id, each
 carrying status, role, and `report_back_to_session_id`
 (`crates/jcode-app-core/src/server/comm_session.rs:502-519` inserts exactly
@@ -1045,6 +1071,10 @@ export function isTerminalStatus(status) {
 ---
 
 # STEP 7 - `src/swarm/SwarmRegistry.js`
+
+**In plain English:** the phone book. One place that holds every member, the
+engine that powers it, and its session - so anything in the system can look up
+any agent by id. It is literally three Maps with getters.
 
 **What jcode does:**
 
@@ -1135,6 +1165,11 @@ export class SwarmRegistry {
 
 # STEP 8 - `src/swarm/ancestry.js`
 
+**In plain English:** family-tree math. Given only each member's "who I report
+to" pointer, these functions compute the parent, the children, how deep in the
+tree someone is, and the authorization question that matters: "is this agent
+one of mine?"
+
 **What jcode does:** walks `report_back_to_session_id` to rebuild the tree on
 demand. Ownership is defined as *is this in the subtree I spawned*
 (`crates/jcode-app-core/src/server/swarm.rs:995-1213`).
@@ -1202,6 +1237,11 @@ wrong-but-visible number.
 ---
 
 # STEP 9 - `src/swarm/caps.js`
+
+**In plain English:** the bouncer. A single function that answers "may this
+agent spawn another one right now?" - checking a hard member cap, a budget of
+how many may be alive at once, and whether this agent is even allowed to spawn
+in the current mode.
 
 **What jcode does:** two independent limits plus a mode gate. An absolute cap
 (`MAX_SWARM_MEMBERS = 1000`), a configurable live-worker budget, and the rule
@@ -1273,6 +1313,10 @@ and report back" redirects it. Error strings aimed at an LLM are control flow.
 ---
 
 # STEP 10 - `src/swarm/Swarm.js`
+
+**In plain English:** the manager. The one object that creates members (each
+is just another QueryEngine), starts their work in the background, and keeps a
+handle to every running job so you can wait for it or cancel it later.
 
 The centre of Part 1: the object that owns many `QueryEngine`s.
 
@@ -1462,6 +1506,10 @@ architecture. The only genuinely new field in the entire object is
 
 # STEP 11 - `src/tools/SpawnTool/SpawnTool.js`
 
+**In plain English:** the "hire a teammate" button, exposed as a tool the
+model can call. Give it instructions, and it immediately answers "they're on
+it" while the new agent works in the background.
+
 **The payoff for a decision you made long ago:** `sessionContext` is already
 handed to every tool, and Step 10 put `swarm` on it. So the spawn tool reaches
 the swarm through plumbing that already existed. No new wiring, no globals, no
@@ -1534,6 +1582,10 @@ parallelism.
 ---
 
 # STEP 12 - `src/swarm/lifecycle.js`
+
+**In plain English:** endings and handoffs. When a worker finishes, its report
+is delivered into its parent's conversation; when a mid-tree member dies, its
+children are re-attached to a living relative instead of being orphaned.
 
 **What jcode does:** when a member leaves mid-tree its children are
 **reparented rather than orphaned** - they attach to their live grandparent,
@@ -1686,6 +1738,11 @@ awaitMembers       no           yes           yes       event + re-check state
 
 # STEP 13 - `src/services/swarm/planFanOut.js`
 
+**In plain English:** start several workers at once, then wait for ALL of them
+to finish before doing anything with the results. The simplest way to collect
+parallel work - and the right one when you need everything and have nothing
+useful to do in the meantime.
+
 **What jcode does:** an LLM planner decomposes a task, the pieces run
 concurrently under `try_join_all`, and the results are folded back into an
 integration prompt (`crates/jcode-app-core/src/server/swarm.rs:1657-1671`).
@@ -1759,6 +1816,10 @@ switch to `Promise.allSettled`.
 
 # STEP 14 - `src/services/swarm/drainAsCompleted.js`
 
+**In plain English:** same fixed set of workers, but you receive each result
+the moment it lands instead of waiting for the slowest one - so you can update
+a progress line, stream to a UI, or stop early once you have enough.
+
 **What jcode does:** `FuturesUnordered` inside the batch tool, built at
 `crates/jcode-app-core/src/tool/batch.rs:282-295` and drained as results land
 at `:300-317`, publishing progress after each one.
@@ -1826,6 +1887,10 @@ Rust has a purpose-built `FuturesUnordered` instead of doing this.
 ---
 
 # STEP 15 - `src/services/swarm/awaitMembers.js`
+
+**In plain English:** wait for a condition like "all my workers are done" when
+the set of workers can CHANGE while you wait - new ones appear, some crash. It
+sleeps until an event or a deadline, then re-checks reality from the registry.
 
 **What jcode does:** a long-lived task that `select!`s between a deadline timer
 and a broadcast receiver, re-checking a satisfaction predicate against shared
@@ -1921,6 +1986,10 @@ one-liner.
 
 # STEP 16 - `src/swarm/abortTree.js`
 
+**In plain English:** the kill switch for a whole branch. Cancel one member
+and - through the chained signals from Step 4 - everything beneath it, then
+actually WAIT for them to wind down before declaring them stopped.
+
 **What jcode does:** `RuntimeTaskScope`
 (`crates/jcode-app-core/src/server/runtime.rs:27-79`) pairs a `JoinSet` with a
 `CancellationToken`, and its `shutdown` deliberately drains the set *before*
@@ -1996,6 +2065,10 @@ tool that never wired up `signal` (which is exactly why Step 3 threaded it into
 ---
 
 # STEP 17 - `src/swarm/interrupt.js`
+
+**In plain English:** a mailbox per agent. Messages from teammates queue up
+here and get slipped into the agent's conversation between turns - never in
+the middle of a tool call, never while a response is streaming.
 
 **What jcode does:** notifications - DMs, broadcasts, lifecycle events - are
 queued as soft interrupts and injected into a running agent at safe points, so
@@ -2085,6 +2158,10 @@ context you pay to look at another agent).
 
 # STEP 18 - `src/events/swarmEvents.js`
 
+**In plain English:** the list of event names the swarm emits, written once as
+constants so a typo becomes a visible error instead of a listener that
+silently never fires.
+
 **Why constants rather than string literals:** you are about to emit and
 subscribe to these from a dozen places. One typo in `'swarm:staus'` produces a
 listener that silently never fires - no error, no warning, just a UI that never
@@ -2123,6 +2200,10 @@ export const SwarmEvents = {
 ---
 
 # STEP 19 - `src/events/EventBus.js` - add a replay buffer
+
+**In plain English:** give your existing event bus a short memory. Late
+arrivals - a member spawned mid-run, a UI panel opened halfway through - can
+ask "what did I miss?" instead of starting blind.
 
 **What jcode does:** the global bus is a `tokio::sync::broadcast`
 (`crates/jcode-base/src/bus.rs:499-502`), which keeps a bounded ring of recent
@@ -2213,6 +2294,10 @@ constantly, that goes from unlikely to routine.
 ---
 
 # STEP 20 - `src/services/comms/routing.js`
+
+**In plain English:** the post office. One send function that decides who
+receives a message: a single agent (DM), a topic group (channel), or - the
+default - just the agents you yourself spawned (subtree broadcast).
 
 **What jcode does:** one send path routes by which fields are populated - with
 `to_session` it is a DM, with `channel` it posts to that channel, with neither
@@ -2352,6 +2437,11 @@ export const MessageTool = buildTool({
 
 # STEP 21 - `src/services/comms/reads.js`
 
+**In plain English:** three ways to look at another agent, priced by how much
+context they cost: a one-line status check, a short summary of recent
+activity, or its entire transcript. You pick the cheapest one that answers
+your question.
+
 **What jcode does:** three genuinely separate operations, in
 `crates/jcode-app-core/src/server/comm_sync.rs` - status, summary, and full
 context read.
@@ -2446,6 +2536,10 @@ export function fullContext(swarm, requesterId, targetId) {
 ---
 
 # STEP 22 - `src/services/comms/persist.js`
+
+**In plain English:** save the member list to disk and load it back after a
+restart - but on load, rewrite statuses like "running" to "crashed", because
+the process that was running no longer exists.
 
 **What jcode does:** members are saved as durable records and, on load,
 `recover_member_status` **rewrites** the status rather than restoring it -
@@ -2553,6 +2647,11 @@ closed set of **validated mutations** that are the only legal way to change it.
 ---
 
 # STEP 23 - `src/dag/types.js`
+
+**In plain English:** the vocabulary of the task graph. It defines what a task
+node is (an instruction plus its dependencies), what kinds of work exist,
+where a node came from, and what a finished worker must hand back (the
+artifact: findings, confidence, and what it skipped).
 
 **What jcode does:** `crates/jcode-plan/src/dag/mod.rs` - `Mode` at `:37-49`,
 `NodeOrigin` at `:58-67`, `NodeKind` and a per-kind `gate_kind()` at `:72-102`.
@@ -2725,6 +2824,10 @@ export function err(code, message) {
 
 # STEP 24 - `src/dag/confidence.js`
 
+**In plain English:** a forgiving parser that turns whatever an agent writes
+for confidence - "high", "7/10", "not really sure" - into one of three rungs:
+low, medium, or high. Anything unreadable counts as low.
+
 **What jcode does:** `ConfidenceLevel::parse` at
 `crates/jcode-plan/src/dag/mod.rs:141-204`.
 
@@ -2817,6 +2920,11 @@ how sure it is, the gate should look harder, not less hard.
 ---
 
 # STEP 25 - `src/dag/TaskGraph.js`
+
+**In plain English:** the plan itself, kept in a locked box. Nobody - not even
+your own code, outside a short list of blessed operations - can reach in and
+edit a task directly. Every change goes through a validated operation that can
+say no.
 
 **What jcode does:** the node collection is a **private** field
 (`crates/jcode-plan/src/dag/mod.rs:541`), so the only way to change the graph is
@@ -2932,6 +3040,10 @@ partial writes, no half-applied decomposition to clean up.
 ---
 
 # STEP 26 - `src/dag/ops.js`
+
+**In plain English:** the two ways a plan grows. `seed` lays down the initial
+tasks; `expandNode` is how a worker says "my task is really four tasks" and
+splits it into children it will later synthesize.
 
 **What jcode does:** `seed` at `crates/jcode-plan/src/dag/ops.rs:19-76`,
 `ensure_root_gate` at `:143-209`, `expand_node` at `:227-367`.
@@ -3159,6 +3271,10 @@ export function expandNode(graph, nodeId, actor, specs) {
 
 # STEP 27 - `src/dag/complete.js`
 
+**In plain English:** how a task gets marked done. Not by flipping a flag -
+the worker must hand in a structured report (what it found, how sure it is,
+what it skipped), and that report is checked before the task closes.
+
 **What jcode does:** `complete_node` at
 `crates/jcode-plan/src/dag/ops.rs:377-411`, artifact validation at `:703-758`.
 
@@ -3276,6 +3392,11 @@ export function requeueFailed(graph, nodeId) {
 ---
 
 # STEP 28 - `src/dag/gates.js` - the anti-rubber-stamp machinery
+
+**In plain English:** the reviewer that cannot be lazy. A gate is a special
+task whose job is to audit its siblings - and the code refuses to let it pass
+unless it names every task it audited, or adds new work to cover what is
+missing. "Looks good to me" is structurally impossible.
 
 This is the step. Everything else in Part 4 exists to make it possible.
 
@@ -3518,6 +3639,11 @@ which is why it holds even when the model is careless.
 
 # STEP 29 - `src/dag/scheduler.js`
 
+**In plain English:** traffic control for the graph. Three small jobs: work
+out which tasks are ready to run right now, let a worker claim one (first
+come, first served), and build that worker's prompt out of its own instruction
+plus the reports from every task it depends on.
+
 **What jcode does:** `crates/jcode-plan/src/dag/schedule.rs` - `is_terminal` at
 `:15`, `ready_nodes` at `:21`, `dispatch` at `:44`, `assemble_input` at `:64`.
 
@@ -3703,6 +3829,11 @@ you.
 
 # STEP 30 - `src/services/swarm/SwarmRunner.js`
 
+**In plain English:** the engine that drives the whole machine. In a loop:
+take the tasks that are ready, hand each to a freshly spawned worker, wait for
+their reports, feed the results back into the graph - and repeat until nothing
+is left, remembering that the graph can GROW while you drain it.
+
 The piece nothing else covers: pull ready nodes off the graph, hand each to a
 worker, feed the result back in.
 
@@ -3841,6 +3972,9 @@ as Step 25, one level up.
 
 # STEP 31 - `src/components/SwarmView.jsx`
 
+**In plain English:** a live panel in your terminal showing the member tree -
+who exists, who reports to whom, who is running right now, who finished.
+
 **What jcode does:** a live widget showing agents, status, and current task,
 updating from event streams (docs/SWARM_ARCHITECTURE.md, "UI (TUI)").
 
@@ -3918,6 +4052,10 @@ event, liveness by poll.
 
 # STEP 32 - `src/components/DagView.jsx`
 
+**In plain English:** a live panel showing the task graph - what is done, what
+is ready, what depends on what, and whether the plan actually grew beyond its
+first draft.
+
 **The one thing this must show that a task list cannot:** the seeded/grown split
 from Step 23. If a deep run ends with everything still `seed`, nothing
 decomposed and no gate found anything - your rigor machinery never fired.
@@ -3968,6 +4106,10 @@ export function DagView({ graph }) {
 
 # STEP 33 - `src/screens/REPL.jsx`
 
+**In plain English:** wire the two panels into the chat screen you already
+have, shown only while a swarm is running - single-agent mode looks exactly
+like it does today.
+
 Your existing REPL renders `MessageList`, `PromptInput`, and `StatusBar`. Add
 the two swarm panels above the message list, gated on whether a swarm is
 running so single-agent mode looks exactly as it does today:
@@ -3990,6 +4132,11 @@ of one.
 ---
 
 # STEP 34 - `src/entrypoints/cli.jsx` and the demo
+
+**In plain English:** the first end-to-end run - a scripted demo needing no
+API key, staged so you personally watch the three behaviours that make this a
+swarm and not a task list: workers running in parallel, a lazy reviewer
+getting rejected by name, and the plan growing from an honest admission.
 
 **What the demo script deliberately does:** the first worker admits it did not
 check something (so a gap node gets injected), and the first gate attempt is a
@@ -4215,6 +4362,12 @@ Do Step 35 before you ever run this against real code.
 
 # STEP 35 - `src/services/permissions/rules.js`
 
+**In plain English:** the safety rules. A single pure function that every
+dangerous tool asks "may I?" before acting - refusing destructive shell
+commands, refusing writes outside the project folder, and refusing all writes
+in plan mode. No prompts, no human in the loop, so it works for six agents at
+once.
+
 **The problem, stated plainly:** you have built an agent that runs shell
 commands and writes files, and then made six copies of it. Every
 `checkPermissions` in your codebase currently returns `{ granted: true }`.
@@ -4356,6 +4509,10 @@ this whole system does.
 
 # STEP 36 - `src/services/swarm/planTask.js`
 
+**In plain English:** the front door. One plain model call - no tools, no
+agent loop - that turns your task sentence ("add multimonitor support") into
+the initial set of task nodes for the graph.
+
 **The gap this closes:** everything in Part 5 assumes a graph already exists.
 `cli.jsx` hardcodes `seed(graph, [...])`. For your own work you need the front
 door: *your task* goes in, *seed nodes* come out.
@@ -4464,6 +4621,9 @@ most of what makes prompt iteration tolerable.
 
 # STEP 37 - `src/services/swarm/CostTracker.js`
 
+**In plain English:** the bill. It listens to every member's token usage as
+events go by, adds it all up, and prints what the run cost in dollars.
+
 **Why this is not optional:** Anthropic's published figure for their own
 multi-agent research system is roughly **15x** the tokens of a single-agent
 run, and a misbehaving subagent that spawns more subagents multiplies that
@@ -4539,6 +4699,11 @@ than any amount of reading, including this document.
 ---
 
 # STEP 38 - `src/services/swarm/Timeline.js`
+
+**In plain English:** the proof of parallelism. An ASCII gantt chart of when
+each worker started and finished, plus one number - the peak count running at
+once - that tells you whether your swarm was actually parallel or secretly
+sequential.
 
 **The question no other view answers:** did the agents actually run *at the same
 time*? The member tree shows you the current frame. A log shows you an ordered
@@ -4626,6 +4791,9 @@ blocking call, which is otherwise nearly invisible.
 
 # STEP 39 - `src/tools/ChannelTool/ChannelTool.js`
 
+**In plain English:** the tool that lets an agent join a topic channel, so
+that channel messages from Step 20 actually have someone to reach.
+
 **Closing a real gap:** Step 20 gave you `joinChannel`, but nothing exposes it,
 so agents can post to channels they can never join. This is the smallest step
 here and it makes topic groups actually reachable.
@@ -4670,6 +4838,11 @@ sparingly, and notice if your agents start chatting more than they report.
 ---
 
 # STEP 40 - Enforcing single-writer
+
+**In plain English:** make "many agents read, one agent writes" a fact of the
+code instead of a hope. Workers get read-only tools; only the orchestrator
+gets write, edit, shell, and spawn - so a worker cannot change the repository
+even if its prompt asks it to.
 
 Time to make the rule from the top of this document structural instead of
 advisory.
@@ -4738,6 +4911,11 @@ arbitrary shell.
 ---
 
 # STEP 41 - Run it for real
+
+**In plain English:** the real entrypoint. Type an actual task, let the
+planner turn it into a graph, run the swarm against a real repository, and get
+back findings, a timeline, and the cost - with `--plan` mode as the read-only
+safety catch for first contact.
 
 Everything assembled, against an actual repository.
 
@@ -4935,6 +5113,11 @@ of building agents. The machinery you built is what makes those failures
 ---
 
 # STEP 42 - Give the graph to the agents
+
+**In plain English:** hand the plan to the agents themselves. A new tool lets
+each worker mark its own task done, split it into subtasks, or add missing
+work - so the plan reshapes itself as agents learn, and the runner demotes to
+a fallback for workers that forget to use the tool.
 
 This is the step that closes the last real architectural gap between your MVP
 and jcode. Do it once Step 41 runs.
