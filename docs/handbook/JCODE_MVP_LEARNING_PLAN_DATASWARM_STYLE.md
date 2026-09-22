@@ -1734,6 +1734,41 @@ drainAsCompleted   yes          yes           no        incremental drain
 awaitMembers       no           yes           yes       event + re-check state
 ```
 
+**Who chooses among these three - and when.** Nothing does, automatically.
+There is no runtime selector, no config flag, no heuristic that inspects the
+work and picks a strategy. The choice is made *statically, by you, at the call
+site you write* - exactly like reaching for `map` vs `filter` vs `reduce`. You
+build all three here so you know all three; that does not mean all three get
+wired in.
+
+In fact, **this MVP effectively uses only one.** The driver you write in
+Step 30 (`SwarmRunner`) hardcodes the `planFanOut` shape - a plain `Promise.all`
+inlined into the loop. `drainAsCompleted` and `awaitMembers` are built and
+tested but never called by the runner; they are yours to reach for the day a
+code path genuinely needs them (a live progress bar, or a wait over a set that
+grows while you wait).
+
+**How this maps to real jcode.** Same principle - no auto-selector - but the
+three live at different call sites, and only one is handed to the model:
+
+- `awaitMembers` -> jcode's `comm_await` is **exposed to the LLM as a
+  parameterized tool** (`await_members`, with `mode: any|all`, `timeout_secs`,
+  `session_ids`, inline-vs-background). The agent steers *this one* at runtime -
+  but it is tuning a single strategy, not choosing among the three.
+- `drainAsCompleted` -> jcode's `FuturesUnordered` is **internal to the batch
+  tool** (`tool/batch.rs`). It runs whenever the model batches several tool
+  calls, but the model never selects it *as* a collection strategy.
+- `planFanOut` -> jcode's `try_join_all` lives in `run_swarm_message`
+  (`server/swarm.rs`) and is **reachable only through debug-socket commands**,
+  not the production swarm path (see the caveat in Step 13).
+
+So the honest summary: **jcode surfaces exactly one of the three fan-in
+strategies to the LLM as a tool - the event-driven wait - and keeps the other
+two internal.** Your MVP is faithful at the *mechanism* level (all three
+idioms are correct ports) and simplified at the *wiring* level (the runner
+hardcodes one; none are tools). That gap is deliberate, and closing it is a
+"what to build next" item, not a step here.
+
 ---
 
 # STEP 13 - `src/services/swarm/planFanOut.js`
@@ -5528,6 +5563,21 @@ tools so they can restructure the plan mid-run - which is how jcode actually
 works (`crates/jcode-app-core/src/tool/communicate.rs:2629-2718` dispatches
 exactly these into the engine). This is the biggest single step toward the real
 thing.
+
+**Expose fan-in as the agent's choice (not the runner's).** This is the other
+half of the tool-surface story, and it is distinct from the DAG tools above.
+Right now your runner hardcodes the wait: it fans out and `Promise.all`s the
+batch itself (the `planFanOut` shape from Part 2), and `drainAsCompleted` /
+`awaitMembers` sit unused. Real jcode instead lets the *coordinator agent*
+decide when and how to wait, by surfacing one strategy as a tool. To match it:
+(a) expose `awaitMembers` as an LLM tool with `mode` (any|all), `timeout`, and
+`session_ids` params, so the model chooses who to wait for and for how long;
+(b) route parallel tool calls through a batch tool that uses `drainAsCompleted`
+internally, so batched calls stream results as they land; and (c) delete the
+hardcoded `Promise.all` wait from the runner, letting the coordinator drive
+coordination through that tool instead of a fixed loop. Only *one* of the three
+strategies (the event-driven wait) becomes agent-facing - the other two stay
+internal, exactly as jcode does it.
 
 **Bring back compaction, per member.** You already have
 `services/context/compactMessages.js` and it already works. Twenty agents with
